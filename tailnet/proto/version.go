@@ -104,6 +104,7 @@ import (
 //   - A v2.14 agent decodes these fields but does not yet enforce the
 //     ordering, so a version check alone does not tell coderd that an agent
 //     orders its scripts.
+//   - Added rx_bytes and tx_bytes to Connection on the agent API.
 const (
 	CurrentMajor = 2
 	CurrentMinor = 14

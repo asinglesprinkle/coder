@@ -3,6 +3,7 @@ package insights
 import (
 	"context"
 	"encoding/json"
+	"maps"
 	"slices"
 	"sync/atomic"
 	"time"
@@ -20,9 +21,10 @@ import (
 )
 
 var (
-	templatesActiveUsersDesc     = prometheus.NewDesc("coderd_insights_templates_active_users", "The number of active users of the template.", []string{"template_name", "organization_name"}, nil)
-	applicationsUsageSecondsDesc = prometheus.NewDesc("coderd_insights_applications_usage_seconds", "The application usage per template. Built-in apps are grouped by app family, such as Visual Studio Code, JetBrains, Web Terminal, or SSH, with an empty slug. A user-minute counts once per family.", []string{"template_name", "application_name", "slug", "organization_name"}, nil)
-	parametersDesc               = prometheus.NewDesc("coderd_insights_parameters", "The parameter usage per template.", []string{"template_name", "parameter_name", "parameter_type", "parameter_value", "organization_name"}, nil)
+	templatesActiveUsersDesc        = prometheus.NewDesc("coderd_insights_templates_active_users", "The number of active users of the template.", []string{"template_name", "organization_name"}, nil)
+	applicationsUsageSecondsDesc    = prometheus.NewDesc("coderd_insights_applications_usage_seconds", "The workspace app usage per template.", []string{"template_name", "application_name", "slug", "organization_name"}, nil)
+	sessionFamiliesUsageSecondsDesc = prometheus.NewDesc("coderd_insights_session_families_usage_seconds", "The built-in app usage per template and app family, such as vscode or ssh.", []string{"template_name", "family", "organization_name"}, nil)
+	parametersDesc                  = prometheus.NewDesc("coderd_insights_parameters", "The parameter usage per template.", []string{"template_name", "parameter_name", "parameter_type", "parameter_value", "organization_name"}, nil)
 )
 
 type MetricsCollector struct {
@@ -216,6 +218,7 @@ func (mc *MetricsCollector) Run(ctx context.Context) (func(), error) {
 func (*MetricsCollector) Describe(descCh chan<- *prometheus.Desc) {
 	descCh <- templatesActiveUsersDesc
 	descCh <- applicationsUsageSecondsDesc
+	descCh <- sessionFamiliesUsageSecondsDesc
 	descCh <- parametersDesc
 }
 
@@ -235,13 +238,12 @@ func (mc *MetricsCollector) Collect(metricsCh chan<- prometheus.Metric) {
 
 	// Built-in apps, one series per app family.
 	for _, templateRow := range data.templates {
+		templateName := data.templateNames[templateRow.TemplateID]
 		orgName := data.organizationNames[templateRow.TemplateID]
 		for _, family := range appFamilySeries {
-			metricsCh <- prometheus.MustNewConstMetric(applicationsUsageSecondsDesc, prometheus.GaugeValue,
+			metricsCh <- prometheus.MustNewConstMetric(sessionFamiliesUsageSecondsDesc, prometheus.GaugeValue,
 				float64(templateRow.SessionFamilyUsageSeconds[string(family)]),
-				data.templateNames[templateRow.TemplateID],
-				family.DisplayName(),
-				"", orgName)
+				templateName, string(family), orgName)
 		}
 	}
 
@@ -287,13 +289,12 @@ func onlyTemplateNames(templates []database.Template) map[uuid.UUID]string {
 	return m
 }
 
-// appFamilySeries lists the app families reported as built-in app series.
-var appFamilySeries = []codersdk.AppFamilyName{
-	codersdk.AppFamilyVSCode,
-	codersdk.AppFamilyJetBrains,
-	codersdk.AppFamilyReconnectingPTY,
-	codersdk.AppFamilySSH,
-}
+// appFamilySeries lists every family in the app registry, plus unknown.
+var appFamilySeries = func() []codersdk.AppFamilyName {
+	families := append(slices.Collect(maps.Values(codersdk.SessionCountAppFamilies())), codersdk.AppFamilyUnknown)
+	slices.Sort(families)
+	return slices.Compact(families)
+}()
 
 func convertParameterInsights(rows []database.GetTemplateParameterInsightsRow) []parameterRow {
 	type uniqueKey struct {

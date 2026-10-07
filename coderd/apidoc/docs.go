@@ -19921,7 +19921,8 @@ const docTemplate = `{
                 "reconnecting_pty",
                 "port_forwarding",
                 "sftp",
-                "unknown"
+                "unknown",
+                "workspace_app"
             ],
             "x-enum-varnames": [
                 "AppFamilyVSCode",
@@ -19930,7 +19931,8 @@ const docTemplate = `{
                 "AppFamilyReconnectingPTY",
                 "AppFamilyPortForwarding",
                 "AppFamilySFTP",
-                "AppFamilyUnknown"
+                "AppFamilyUnknown",
+                "AppFamilyWorkspaceApp"
             ]
         },
         "codersdk.AppHostResponse": {
@@ -29798,7 +29800,15 @@ const docTemplate = `{
             "properties": {
                 "display_name": {
                     "type": "string",
-                    "example": "Visual Studio Code"
+                    "example": "VS Code"
+                },
+                "family": {
+                    "allOf": [
+                        {
+                            "$ref": "#/definitions/codersdk.AppFamilyName"
+                        }
+                    ],
+                    "example": "vscode"
                 },
                 "icon": {
                     "type": "string"
@@ -29806,6 +29816,11 @@ const docTemplate = `{
                 "seconds": {
                     "type": "integer",
                     "example": 80500
+                },
+                "seconds_is_upper_bound": {
+                    "description": "SecondsIsUpperBound marks overflow usage that includes folded apps.\nTheir overlap is not stored, so Seconds may overestimate active time.",
+                    "type": "boolean",
+                    "example": false
                 },
                 "slug": {
                     "type": "string",
@@ -30357,6 +30372,11 @@ const docTemplate = `{
                         "type": "string",
                         "format": "uuid"
                     }
+                },
+                "usage_total_seconds": {
+                    "description": "UsageTotalSeconds counts each user's active minutes once, even when apps\noverlap. Summed per-app seconds can exceed this total.",
+                    "type": "integer",
+                    "example": 120000
                 }
             }
         },

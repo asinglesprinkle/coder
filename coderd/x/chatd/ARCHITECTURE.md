@@ -114,6 +114,8 @@ Each transaction that applies one or more transitions advances the `snapshot_ver
 
 TODO (chat_versions): `LockChatAndBumpSnapshotVersion` now locks the `chats` row `FOR UPDATE` and increments `chat_versions.snapshot_version`. Because the bump no longer rewrites `chats`, the first later `chats` UPDATE in the transaction skips the outgoing foreign key checks. The lock order is always `chats`, then `chat_versions`. Describe this here.
 
+TODO (tx.Current): `ChatMachine.Update` counts queued messages right after the lock and seeds the transaction with the locked row. Callbacks read it with `tx.Current()` and the first transition validates against it, so neither reads the chat again under the lock. Later transitions in the same transaction and the publication read still go to the database. Describe this here.
+
 Chat-message changes update `history_version` on the `chats` table and the `revision` fields on the `chat_messages` table automatically via Postgres triggers described in [Message revisions and history version](#message-revisions-and-history-version). `history_version` stores the latest `snapshot_version` in which chat message history changed. The chat runner and the stream loop rely on it to ensure they are fully aware of the chat's history changes. See [Event processing](#event-processing) for how the runner uses `history_version` differently from `snapshot_version`.
 
 Queue changes update `queue_version` automatically via Postgres triggers described in [Queue version](#queue-version).

@@ -334,7 +334,7 @@ func (s *taskStarter) StartInterrupt(ctx context.Context, input chatWorkerTaskSt
 		messages := partialMessages
 		// Reuse the captured interrupt instant so database delay does not
 		// inflate billing.
-		committedCancels, err := committedPendingLocalToolCancellationMessages(ctx, store, chat, interruptedAt, toolCompletions, canceled)
+		committedCancels, err := committedPendingLocalToolCancellationMessages(tx.Ctx(), store, chat, interruptedAt, toolCompletions, canceled)
 		if err != nil {
 			return xerrors.Errorf("committed pending local tool cancellation messages: %w", err)
 		}
@@ -473,7 +473,7 @@ func (s *taskStarter) cancelRequiresAction(
 			return xerrors.Errorf("load chat for task: %w", err)
 		}
 		if !s.server.disableCallerSuppliedTools && chat.RequiresActionDeadlineAt.Valid {
-			now, err := store.GetDatabaseNow(ctx)
+			now, err := store.GetDatabaseNow(tx.Ctx())
 			if err != nil {
 				return xerrors.Errorf("get database time: %w", err)
 			}

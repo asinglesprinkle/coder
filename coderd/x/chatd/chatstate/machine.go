@@ -9,6 +9,7 @@ import (
 	"golang.org/x/xerrors"
 
 	"github.com/coder/coder/v2/coderd/database"
+	"github.com/coder/coder/v2/coderd/database/dbauthz"
 	coderdpubsub "github.com/coder/coder/v2/coderd/pubsub"
 )
 
@@ -244,12 +245,18 @@ func (m *ChatMachine) updateOnce(
 			}
 			return xerrors.Errorf("lock chat and bump snapshot: %w", err)
 		}
-		queued, err := store.CountChatQueuedMessages(ctx, m.chatID)
+		// Lets dbauthz authorize the transition's chat reads and writes
+		// without reading the chat again under the lock.
+		txCtx, err := dbauthz.WithChatRBAC(ctx, dbauthz.CacheableChatRBAC(locked))
+		if err != nil {
+			return xerrors.Errorf("cache chat rbac: %w", err)
+		}
+		queued, err := store.CountChatQueuedMessages(txCtx, m.chatID)
 		if err != nil {
 			return xerrors.Errorf("count queued messages: %w", err)
 		}
 		tx := &Tx{
-			ctx:    ctx,
+			ctx:    txCtx,
 			store:  store,
 			chatID: m.chatID,
 			locked: &lockedRow{chat: locked, hasQueued: queued > 0},
@@ -270,7 +277,7 @@ func (m *ChatMachine) updateOnce(
 			return xerrors.Errorf("buffer chat update: %w", err)
 		}
 		if state.IsRunnable() {
-			stale, err := ownershipStaleOrMissing(ctx, store, chat, HeartbeatStaleSeconds)
+			stale, err := ownershipStaleOrMissing(txCtx, store, chat, HeartbeatStaleSeconds)
 			if err != nil {
 				return xerrors.Errorf("evaluate ownership: %w", err)
 			}

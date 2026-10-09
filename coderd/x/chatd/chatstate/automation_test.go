@@ -780,7 +780,7 @@ func TestChatMachine_Update_RetriesAutomationDeadlocks(t *testing.T) {
 			retrying := chatstate.NewChatMachine(newDeadlockStore(f.DB, tc.failures), f.Pub, chat.Chat.ID)
 			attempts := 0
 			var promoted *database.ChatMessage
-			err := retrying.Update(ctx, func(tx *chatstate.Tx, _ database.Store) error {
+			updated, err := retrying.UpdateReturning(ctx, func(tx *chatstate.Tx, _ database.Store) error {
 				attempts++
 				res, err := tx.FinishTurn(chatstate.FinishTurnInput{})
 				promoted = res.PromotedMessage
@@ -789,10 +789,12 @@ func TestChatMachine_Update_RetriesAutomationDeadlocks(t *testing.T) {
 			require.Equal(t, tc.wantAttempts, attempts)
 			if tc.wantErr {
 				require.True(t, database.IsDeadlockError(err), "got %v", err)
+				require.Zero(t, updated, "an aborted final attempt returns no row")
 				require.Equal(t, []int64{queued.ID}, queuedIDsByPosition(ctx, t, f, chat.Chat.ID))
 				return
 			}
 			require.NoError(t, err)
+			require.Equal(t, f.readChat(ctx, t, chat.Chat.ID), updated, "the row comes from the committed attempt")
 			require.NotNil(t, promoted)
 			requireQueuedMessageLink(t, *promoted, queued.ID)
 		})

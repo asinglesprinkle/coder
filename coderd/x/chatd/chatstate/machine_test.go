@@ -9,12 +9,16 @@ import (
 	"testing"
 
 	"github.com/google/uuid"
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/stretchr/testify/require"
 
+	"cdr.dev/slog/v3/sloggers/slogtest"
 	"github.com/coder/coder/v2/coderd/database"
+	"github.com/coder/coder/v2/coderd/database/dbauthz"
 	"github.com/coder/coder/v2/coderd/database/dbgen"
 	"github.com/coder/coder/v2/coderd/database/dbtestutil"
 	coderdpubsub "github.com/coder/coder/v2/coderd/pubsub"
+	"github.com/coder/coder/v2/coderd/rbac"
 	"github.com/coder/coder/v2/coderd/x/chatd/chatprompt"
 	"github.com/coder/coder/v2/coderd/x/chatd/chatstate"
 	"github.com/coder/coder/v2/codersdk"
@@ -417,4 +421,55 @@ func countChannel(channels []string, channel string) int {
 		}
 	}
 	return c
+}
+
+// TestChatMachine_Update_AuthorizesFromCachedChatRBAC covers that dbauthz
+// authorizes a transition's chat writes from the RBAC object Update caches
+// from the locked row, and the lock itself from a caller-cached object.
+func TestChatMachine_Update_AuthorizesFromCachedChatRBAC(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name        string
+		callerCache bool
+		// The transition validates from the locked row and the post-lock
+		// queue count authorizes from the cache, so only Update's
+		// publication read always reads the chat; the lock's authorization
+		// read depends on the caller's cache.
+		wantReads int
+	}{
+		{name: "NoCallerCache", callerCache: false, wantReads: 2},
+		{name: "CallerCache", callerCache: true, wantReads: 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			f := newTestFixture(t)
+			created := createTestChat(t, f)
+			counts := &chatReadCounts{}
+			authzDB := dbauthz.New(
+				&chatReadCountingStore{Store: f.DB, counts: counts},
+				rbac.NewStrictCachingAuthorizer(prometheus.NewRegistry()),
+				slogtest.Make(t, nil),
+				nil,
+			)
+			//nolint:gocritic // Transitions run as chatd.
+			ctx := dbauthz.AsChatd(testutil.Context(t, testutil.WaitShort))
+			if tc.callerCache {
+				var err error
+				ctx, err = dbauthz.WithChatRBAC(ctx, dbauthz.CacheableChatRBAC(created.Chat))
+				require.NoError(t, err)
+			}
+
+			m := chatstate.NewChatMachine(authzDB, f.Pub, created.Chat.ID)
+			require.NoError(t, m.Update(ctx, func(tx *chatstate.Tx, _ database.Store) error {
+				cached, ok := dbauthz.ChatRBACFromContext(tx.Ctx())
+				require.True(t, ok)
+				require.Equal(t, created.Chat.ID.String(), cached.ID)
+				_, err := tx.FinishTurn(chatstate.FinishTurnInput{})
+				return err
+			}))
+			require.Equal(t, tc.wantReads, counts.getChatByID)
+			require.Equal(t, database.ChatStatusWaiting, f.readChat(ctx, t, created.Chat.ID).Status)
+		})
+	}
 }

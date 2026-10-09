@@ -113,7 +113,9 @@ type Manager struct {
 	closeOnce sync.Once
 
 	// lastSources is the most recent sources passed to ReloadSources.
+	// Watched config changes reload with them while sources is unset.
 	lastSources []ConfigSource
+	sources     func() []ConfigSource
 
 	// watcher fires a debounced Reload when any watched config
 	// file is created, written, removed, or renamed. It is armed
@@ -195,14 +197,54 @@ func (m *Manager) Reload(ctx context.Context, paths []string) error {
 //
 // Sources are deduplicated by path; the first source for a path wins.
 func (m *Manager) ReloadSources(ctx context.Context, sources []ConfigSource) error {
-	ch, started, err := m.startReloadIfNeeded(uniqueSources(sources))
-	if err != nil {
-		return err
+	return m.reloadFrom(ctx, func() []ConfigSource { return sources })
+}
+
+// SetSources registers the function that computes the current config
+// sources, called on every ReloadCurrent and config-change reload
+// attempt. ReloadCurrent fails until it is set.
+func (m *Manager) SetSources(sources func() []ConfigSource) {
+	m.mu.Lock()
+	m.sources = sources
+	m.mu.Unlock()
+}
+
+// ReloadCurrent is ReloadSources with the sources function registered by
+// SetSources.
+func (m *Manager) ReloadCurrent(ctx context.Context) error {
+	m.mu.RLock()
+	sources := m.sources
+	m.mu.RUnlock()
+	if sources == nil {
+		return xerrors.New("no MCP config sources registered")
 	}
-	if !started {
-		return nil
+	return m.reloadFrom(ctx, sources)
+}
+
+// maxReloadAttempts bounds reloadFrom when the sources keep changing. A
+// joined in-flight reload may have been started for other sources, so a
+// second attempt is common.
+const maxReloadAttempts = 3
+
+// reloadFrom reloads until the snapshot matches currentSources, which is
+// called on every attempt, and fails after maxReloadAttempts.
+func (m *Manager) reloadFrom(ctx context.Context, currentSources func() []ConfigSource) error {
+	for range maxReloadAttempts {
+		ch, started, err := m.startReloadIfNeeded(uniqueSources(currentSources()))
+		if err != nil {
+			return err
+		}
+		if !started {
+			return nil
+		}
+		if err := m.waitReload(ctx, ch, 0); err != nil {
+			return err
+		}
+		if !m.SnapshotChanged(currentSources()) {
+			return nil
+		}
 	}
-	return m.waitReload(ctx, ch, 0)
+	return xerrors.Errorf("MCP config sources still changing after %d reloads", maxReloadAttempts)
 }
 
 // SetOnReload registers a callback fired (outside the cache lock) after
@@ -222,8 +264,7 @@ func (m *Manager) SetOnReload(fn func()) {
 // exactly once.
 //
 // If a concurrent caller resolves different sources, its sources are
-// not consulted. The next SnapshotChanged check after this reload
-// completes will detect the mismatch and trigger a fresh reload.
+// not consulted by the in-flight body.
 func (m *Manager) startReloadIfNeeded(sources []ConfigSource) (<-chan reloadResult, bool, error) {
 	m.mu.RLock()
 	closed := m.closed
@@ -321,16 +362,23 @@ func sourcePaths(sources []ConfigSource) []string {
 // request.
 func (m *Manager) handleWatchedConfigChange() {
 	m.mu.RLock()
-	sources := slices.Clone(m.lastSources)
+	currentSources := m.sources
+	last := slices.Clone(m.lastSources)
 	closed := m.closed
 	m.mu.RUnlock()
-	if closed || len(sources) == 0 {
+	if closed {
 		return
+	}
+	if currentSources == nil {
+		if len(last) == 0 {
+			return
+		}
+		currentSources = func() []ConfigSource { return last }
 	}
 
 	logger := m.logger.With(slog.F("trigger", "fsnotify"))
 	logger.Debug(m.ctx, "reloading due to config change")
-	if err := m.ReloadSources(m.ctx, sources); err != nil {
+	if err := m.reloadFrom(m.ctx, currentSources); err != nil {
 		if errors.Is(err, ErrManagerClosed) ||
 			errors.Is(err, context.Canceled) {
 			logger.Debug(m.ctx,
@@ -519,10 +567,12 @@ func (m *Manager) doReload(ctx context.Context, sources []ConfigSource) error {
 }
 
 // parseAndDedup returns the servers to run plus a status row for each
-// failed plugin file, invalid plugin entry, and plugin entry whose name
-// was already claimed. Legacy sources claim names before plugin sources,
-// each in source order; the first declaration wins. Missing files and
-// losing legacy entries produce no row.
+// plugin file that failed to load, each invalid plugin entry, and each
+// plugin entry whose name was already claimed or whose
+// "<plugin>/<server>" source is a legacy server's name. Legacy sources claim
+// names before plugin sources, each kind in source order, and the first
+// declaration of a name wins. A missing file and a losing legacy entry
+// produce no row.
 func (m *Manager) parseAndDedup(ctx context.Context, sources []ConfigSource) ([]ServerConfig, []ServerStatus, map[string]fileSnapshot) {
 	logger := m.logger.With(agentchat.Fields(ctx)...)
 
@@ -584,27 +634,42 @@ func (m *Manager) parseAndDedup(ctx context.Context, sources []ConfigSource) ([]
 	}
 
 	claimedBy := make(map[string]string)
+	legacyPaths := make(map[string]string)
 	var deduped []ServerConfig
 	for _, ps := range slices.Concat(legacy, plugins) {
 		for _, cfg := range ps.configs {
-			if winner, taken := claimedBy[cfg.Name]; taken {
-				if cfg.Plugin == nil {
-					continue
+			winner, taken := claimedBy[cfg.Name]
+			var reason string
+			switch {
+			case taken && cfg.Plugin == nil:
+				continue
+			case taken:
+				reason = "server name already in use by " + winner
+			case cfg.Plugin != nil:
+				// A legacy server named "<plugin>/<server>" has this
+				// server's context resource source; the legacy server wins.
+				if legacyPath, ok := legacyPaths[cfg.Plugin.Name+"/"+cfg.Name]; ok {
+					reason = fmt.Sprintf("server ID %q is already used by a legacy server in %s", cfg.Plugin.Name+"/"+cfg.Name, legacyPath)
 				}
+			}
+			if reason != "" {
 				logger.Warn(ctx, "skipping plugin MCP server with a name already in use",
 					slog.F("path", ps.src.Path),
 					slog.F("plugin", cfg.Plugin.Name),
 					slog.F("server", cfg.Name),
-					slog.F("claimed_by", winner),
+					slog.F("reason", reason),
 				)
 				rejected = append(rejected, ServerStatus{
 					Name:       cfg.Name,
 					PluginName: cfg.Plugin.Name,
-					Err:        "server name already in use by " + winner,
+					Err:        reason,
 				})
 				continue
 			}
 			claimedBy[cfg.Name] = describeSource(ps.src)
+			if cfg.Plugin == nil {
+				legacyPaths[cfg.Name] = ps.src.Path
+			}
 			deduped = append(deduped, cfg)
 		}
 	}

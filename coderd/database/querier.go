@@ -103,7 +103,8 @@ type sqlcQuerier interface {
 	// workspace (lower build number than the given build), keeping the rows so
 	// the history of which secrets earlier builds received stays inspectable.
 	// Rows of the given build and of any later build are left untouched, so a
-	// build that clears out of order cannot wipe a newer build's secrets.
+	// build that clears out of order cannot wipe a newer build's secrets. The
+	// cutoff build must belong to the workspace; otherwise nothing is cleared.
 	ClearWorkspaceSecretsBeforeBuild(ctx context.Context, arg ClearWorkspaceSecretsBeforeBuildParams) error
 	// Drops the values of every live row of the workspace, keeping the rows as
 	// history. Used when the workspace is deleted.

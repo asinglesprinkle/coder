@@ -41,7 +41,8 @@ RETURNING *;
 -- workspace (lower build number than the given build), keeping the rows so
 -- the history of which secrets earlier builds received stays inspectable.
 -- Rows of the given build and of any later build are left untouched, so a
--- build that clears out of order cannot wipe a newer build's secrets.
+-- build that clears out of order cannot wipe a newer build's secrets. The
+-- cutoff build must belong to the workspace; otherwise nothing is cleared.
 UPDATE workspace_secrets
 SET
     value        = NULL,
@@ -55,6 +56,7 @@ WHERE workspace_secrets.workspace_build_id = workspace_builds.id
       SELECT current_build.build_number
       FROM workspace_builds AS current_build
       WHERE current_build.id = @workspace_build_id
+        AND current_build.workspace_id = @workspace_id
   );
 
 -- name: ClearWorkspaceSecretsByWorkspaceID :exec

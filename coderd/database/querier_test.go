@@ -20173,18 +20173,33 @@ func TestClearWorkspaceSecretsBeforeBuild(t *testing.T) {
 		})
 	}
 
-	// Build 2 clearing late must not touch build 3, which is newer.
-	err := db.ClearWorkspaceSecretsBeforeBuild(ctx, database.ClearWorkspaceSecretsBeforeBuildParams{
-		WorkspaceID:      ws.ID,
-		WorkspaceBuildID: build2.ID,
-	})
-	require.NoError(t, err)
-
 	live := func(buildID uuid.UUID) int {
 		rows, err := db.ListActiveWorkspaceSecrets(ctx, buildID)
 		require.NoError(t, err)
 		return len(rows)
 	}
+
+	// A cutoff build from another workspace must clear nothing, even though
+	// its build number is higher than every build of this workspace.
+	otherBuild := dbfake.WorkspaceBuild(t, db, database.WorkspaceTable{
+		OrganizationID: org.ID,
+		OwnerID:        user.ID,
+	}).Seed(database.WorkspaceBuild{BuildNumber: 10}).Do().Build
+	err := db.ClearWorkspaceSecretsBeforeBuild(ctx, database.ClearWorkspaceSecretsBeforeBuildParams{
+		WorkspaceID:      ws.ID,
+		WorkspaceBuildID: otherBuild.ID,
+	})
+	require.NoError(t, err)
+	for _, b := range []database.WorkspaceBuild{build1, build2, build3} {
+		require.Equal(t, 1, live(b.ID), "another workspace's build clears nothing")
+	}
+
+	// Build 2 clearing late must not touch build 3, which is newer.
+	err = db.ClearWorkspaceSecretsBeforeBuild(ctx, database.ClearWorkspaceSecretsBeforeBuildParams{
+		WorkspaceID:      ws.ID,
+		WorkspaceBuildID: build2.ID,
+	})
+	require.NoError(t, err)
 	require.Equal(t, 0, live(build1.ID), "earlier build is cleared")
 	require.Equal(t, 1, live(build2.ID), "the clearing build keeps its own secrets")
 	require.Equal(t, 1, live(build3.ID), "a later build is untouched")
@@ -20196,6 +20211,131 @@ func TestClearWorkspaceSecretsBeforeBuild(t *testing.T) {
 		require.Equal(t, row.WorkspaceBuildID == build1.ID, row.ClearedAt.Valid,
 			"only build 1's row is cleared")
 	}
+}
+
+// TestInsertWorkspaceSecretBuildMismatch checks that a secret cannot name a
+// build of another workspace. Inserts are authorized by workspace_id while
+// reads select by workspace_build_id, so the pair must come from one build.
+func TestInsertWorkspaceSecretBuildMismatch(t *testing.T) {
+	t.Parallel()
+
+	db, _ := dbtestutil.NewDB(t)
+	ctx := testutil.Context(t, testutil.WaitShort)
+
+	org := dbgen.Organization(t, db, database.Organization{})
+	user := dbgen.User(t, db, database.User{})
+	newWorkspace := func() dbfake.WorkspaceResponse {
+		return dbfake.WorkspaceBuild(t, db, database.WorkspaceTable{
+			OrganizationID: org.ID,
+			OwnerID:        user.ID,
+		}).Do()
+	}
+	first := newWorkspace()
+	second := newWorkspace()
+
+	_, err := db.InsertWorkspaceSecret(ctx, database.InsertWorkspaceSecretParams{
+		ID:               uuid.New(),
+		WorkspaceID:      first.Workspace.ID,
+		WorkspaceBuildID: second.Build.ID,
+		Name:             "api-key",
+		Value:            sql.NullString{String: "secret", Valid: true},
+		EnvName:          "API_KEY",
+		Source:           database.WorkspaceSecretSourceRequest,
+	})
+	require.True(t, database.IsForeignKeyViolation(err, database.ForeignKeyWorkspaceSecretsBuildWorkspace), err)
+}
+
+// TestWorkspaceSecretLimits exercises the per-build caps enforced by
+// enforce_workspace_secrets_per_build_limits: the accepted value at each cap,
+// the first rejected value past it, and that a second build of the same
+// workspace has its own budget.
+func TestWorkspaceSecretLimits(t *testing.T) {
+	t.Parallel()
+
+	const (
+		countLimit      = 50
+		totalBytesLimit = 204800
+		envBytesLimit   = 24576
+	)
+
+	setup := func(t *testing.T) (database.Store, context.Context, dbfake.WorkspaceResponse) {
+		db, _ := dbtestutil.NewDB(t)
+		ctx := testutil.Context(t, testutil.WaitShort)
+		first := dbfake.WorkspaceBuild(t, db, database.WorkspaceTable{
+			OrganizationID: dbgen.Organization(t, db, database.Organization{}).ID,
+			OwnerID:        dbgen.User(t, db, database.User{}).ID,
+		}).Do()
+		return db, ctx, first
+	}
+	insert := func(ctx context.Context, db database.Store, ws database.WorkspaceTable, build database.WorkspaceBuild, name string, valueBytes int, env bool) error {
+		params := database.InsertWorkspaceSecretParams{
+			ID:               uuid.New(),
+			WorkspaceID:      ws.ID,
+			WorkspaceBuildID: build.ID,
+			Name:             name,
+			Value:            sql.NullString{String: strings.Repeat("a", valueBytes), Valid: true},
+			Source:           database.WorkspaceSecretSourceRequest,
+		}
+		if env {
+			params.EnvName = strings.ToUpper(strings.ReplaceAll(name, "-", "_"))
+		} else {
+			params.FilePath = "/tmp/" + name
+		}
+		_, err := db.InsertWorkspaceSecret(ctx, params)
+		return err
+	}
+	requireLimit := func(t *testing.T, err error, constraint string) {
+		t.Helper()
+		require.True(t, database.IsCheckViolation(err, database.CheckConstraint(constraint)), err)
+	}
+
+	t.Run("Count", func(t *testing.T) {
+		t.Parallel()
+		db, ctx, first := setup(t)
+		ws, build := first.Workspace, first.Build
+
+		for i := range countLimit {
+			require.NoError(t, insert(ctx, db, ws, build, fmt.Sprintf("count-%02d", i), 1, true))
+		}
+		err := insert(ctx, db, ws, build, "count-over", 1, true)
+		requireLimit(t, err, "workspace_secrets_per_build_count_limit")
+
+		// The budget is per build.
+		second := dbfake.WorkspaceBuild(t, db, ws).Seed(database.WorkspaceBuild{BuildNumber: 2}).Do().Build
+		require.NoError(t, insert(ctx, db, ws, second, "count-next-build", 1, true))
+	})
+
+	t.Run("TotalBytes", func(t *testing.T) {
+		t.Parallel()
+		db, ctx, first := setup(t)
+		ws, build := first.Workspace, first.Build
+
+		// File secrets do not count toward the env budget, so the total
+		// budget can be filled exactly.
+		require.NoError(t, insert(ctx, db, ws, build, "total-a", totalBytesLimit-1, false))
+		require.NoError(t, insert(ctx, db, ws, build, "total-b", 1, false))
+		err := insert(ctx, db, ws, build, "total-over", 1, false)
+		requireLimit(t, err, "workspace_secrets_per_build_total_bytes_limit")
+
+		second := dbfake.WorkspaceBuild(t, db, ws).Seed(database.WorkspaceBuild{BuildNumber: 2}).Do().Build
+		require.NoError(t, insert(ctx, db, ws, second, "total-next-build", totalBytesLimit, false))
+	})
+
+	t.Run("EnvBytes", func(t *testing.T) {
+		t.Parallel()
+		db, ctx, first := setup(t)
+		ws, build := first.Workspace, first.Build
+
+		require.NoError(t, insert(ctx, db, ws, build, "env-a", envBytesLimit-1, true))
+		require.NoError(t, insert(ctx, db, ws, build, "env-b", 1, true))
+		err := insert(ctx, db, ws, build, "env-over", 1, true)
+		requireLimit(t, err, "workspace_secrets_per_build_env_bytes_limit")
+		// The env budget is full, but the total budget is not.
+		require.NoError(t, insert(ctx, db, ws, build, "env-full-file", 1, false))
+
+		second := dbfake.WorkspaceBuild(t, db, ws).Seed(database.WorkspaceBuild{BuildNumber: 2}).Do().Build
+		require.NoError(t, insert(ctx, db, ws, second, "env-next-build", envBytesLimit, true))
+	})
 }
 
 func TestClearWorkspaceSecretsByWorkspaceID(t *testing.T) {

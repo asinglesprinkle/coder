@@ -35168,6 +35168,7 @@ WHERE workspace_secrets.workspace_build_id = workspace_builds.id
       SELECT current_build.build_number
       FROM workspace_builds AS current_build
       WHERE current_build.id = $2
+        AND current_build.workspace_id = $1
   )
 `
 
@@ -35180,7 +35181,8 @@ type ClearWorkspaceSecretsBeforeBuildParams struct {
 // workspace (lower build number than the given build), keeping the rows so
 // the history of which secrets earlier builds received stays inspectable.
 // Rows of the given build and of any later build are left untouched, so a
-// build that clears out of order cannot wipe a newer build's secrets.
+// build that clears out of order cannot wipe a newer build's secrets. The
+// cutoff build must belong to the workspace; otherwise nothing is cleared.
 func (q *sqlQuerier) ClearWorkspaceSecretsBeforeBuild(ctx context.Context, arg ClearWorkspaceSecretsBeforeBuildParams) error {
 	_, err := q.db.ExecContext(ctx, clearWorkspaceSecretsBeforeBuild, arg.WorkspaceID, arg.WorkspaceBuildID)
 	return err

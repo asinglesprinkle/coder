@@ -28,7 +28,7 @@ CREATE TYPE workspace_secret_source AS ENUM (
 CREATE TABLE workspace_secrets (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     workspace_id UUID NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
-    workspace_build_id UUID NOT NULL REFERENCES workspace_builds(id) ON DELETE CASCADE,
+    workspace_build_id UUID NOT NULL,
     name TEXT NOT NULL,
     -- The encrypted secret value (base64-encoded encrypted data). NULL once
     -- the row has been cleared.
@@ -49,7 +49,13 @@ CREATE TABLE workspace_secrets (
     -- injection target.
     CONSTRAINT workspace_secrets_requires_target CHECK (env_name <> '' OR file_path <> ''),
     -- A row either holds a value or has been cleared, never both or neither.
-    CONSTRAINT workspace_secrets_value_cleared CHECK ((value IS NULL) = (cleared_at IS NOT NULL))
+    CONSTRAINT workspace_secrets_value_cleared CHECK ((value IS NULL) = (cleared_at IS NOT NULL)),
+    -- The build must belong to the workspace. Inserts are authorized by
+    -- workspace_id and later reads select by workspace_build_id, so a
+    -- mismatched pair would place a secret on another workspace's build.
+    CONSTRAINT workspace_secrets_build_workspace_fkey
+        FOREIGN KEY (workspace_build_id, workspace_id)
+        REFERENCES workspace_builds(id, workspace_id) ON DELETE CASCADE
 );
 
 CREATE UNIQUE INDEX workspace_secrets_build_name_idx ON workspace_secrets(workspace_build_id, name);

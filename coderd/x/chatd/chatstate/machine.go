@@ -32,6 +32,20 @@ type ChatMachine struct {
 	store     database.Store
 	publisher Publisher
 	chatID    uuid.UUID
+	acquirer  LocalAcquirer
+}
+
+// LocalAcquirer lets the replica that makes a chat runnable acquire it in
+// the same transaction, so no ownership hint makes every replica race for
+// the chat row lock.
+type LocalAcquirer interface {
+	// PrepareAcquire runs inside the transaction with the chat locked and
+	// unowned. Returning false leaves the chat to the ownership hint. An
+	// error rolls back the transaction.
+	PrepareAcquire(ctx context.Context, store database.Store, chat database.Chat) (AcquireInput, bool, error)
+	// StartAcquired runs once after commit and publication for a chat
+	// acquired with the input PrepareAcquire returned.
+	StartAcquired(chatID uuid.UUID, input AcquireInput)
 }
 
 // NewChatMachine constructs a chat-scoped state machine handle. The
@@ -49,6 +63,16 @@ func NewChatMachine(
 		publisher: publisher,
 		chatID:    chatID,
 	}
+}
+
+// WithLocalAcquirer returns a copy of m whose top-level updates acquire
+// the chat through a when they leave it runnable and unowned. The
+// machine's store must not be an outer transaction, because a is started
+// after Update's own commit.
+func (m *ChatMachine) WithLocalAcquirer(a LocalAcquirer) *ChatMachine {
+	c := *m
+	c.acquirer = a
+	return &c
 }
 
 // Tx is the per-transaction handle passed to [ChatMachine.Update]
@@ -186,6 +210,11 @@ func (tx *Tx) requireFromAllowed(t Transition) (database.Chat, ExecutionState, e
 // transaction and assign results. Attempts that took no automation locks
 // are never retried, and neither is an Update nested inside another
 // Update, because the outer transaction is already aborted.
+//
+// With a [LocalAcquirer] attached, a top-level Update that leaves the
+// chat runnable and unowned may acquire it in the same transaction. It
+// then publishes the owned row and no ownership hint, and starts the
+// acquirer once after the committed attempt.
 func (m *ChatMachine) Update(
 	ctx context.Context,
 	fn func(*Tx, database.Store) error,
@@ -195,10 +224,11 @@ func (m *ChatMachine) Update(
 }
 
 // UpdateReturning is [ChatMachine.Update] that also returns the chat row
-// Update reads after fn for publication, so callers do not read it again
-// under the lock. The row comes from the last attempt and is zero if fn
-// or that read failed. It is still set when the commit or publication
-// fails afterwards, so treat it as committed only when err is nil.
+// Update publishes after fn and any local acquire, so callers do not read
+// it again under the lock. The row comes from the last attempt and is zero
+// if fn or that read failed. It is still set when the commit or
+// publication fails afterwards, so treat it as committed only when err is
+// nil.
 func (m *ChatMachine) UpdateReturning(
 	ctx context.Context,
 	fn func(*Tx, database.Store) error,
@@ -212,11 +242,11 @@ func (m *ChatMachine) UpdateReturning(
 	if _, nested := updateAttemptFromContext(ctx); nested {
 		// The outer Update owns the transaction, its lock record, and
 		// any retry.
-		return m.updateOnce(ctx, fn)
+		return m.updateOnce(ctx, fn, nil)
 	}
 	for attempt := 1; ; attempt++ {
 		state := &updateAttempt{}
-		chat, err := m.updateOnce(context.WithValue(ctx, updateAttemptKey{}, state), fn)
+		chat, err := m.updateOnce(context.WithValue(ctx, updateAttemptKey{}, state), fn, m.acquirer)
 		if err == nil || attempt >= maxUpdateAttempts ||
 			!state.automationLocks || !database.IsDeadlockError(err) {
 			return chat, err
@@ -228,16 +258,23 @@ func (m *ChatMachine) UpdateReturning(
 const maxUpdateAttempts = 3
 
 // updateOnce runs one Update attempt with its own publish buffer, so an
-// aborted attempt publishes nothing.
+// aborted attempt publishes nothing. A nil acquirer disables local
+// acquisition, which nested updates need because their commit is the
+// outer transaction's.
 func (m *ChatMachine) updateOnce(
 	ctx context.Context,
 	fn func(*Tx, database.Store) error,
+	acquirer LocalAcquirer,
 ) (database.Chat, error) {
 	buffer := NewPublishBuffer(m.publisher)
 	defer buffer.Discard()
 
-	var updated database.Chat
+	var (
+		updated  database.Chat
+		acquired *AcquireInput
+	)
 	err := m.store.InTx(func(store database.Store) error {
+		acquired = nil
 		locked, err := store.LockChatAndBumpSnapshotVersion(ctx, m.chatID)
 		if err != nil {
 			if errors.Is(err, sql.ErrNoRows) {
@@ -269,6 +306,12 @@ func (m *ChatMachine) updateOnce(
 		if err != nil {
 			return err
 		}
+		if acquirer != nil && state.IsRunnable() {
+			chat, acquired, err = acquireLocally(tx, acquirer, chat)
+			if err != nil {
+				return err
+			}
+		}
 		updated = chat
 		if err := buffer.Publish(
 			coderdpubsub.ChatStateUpdateChannel(chat.ID),
@@ -276,7 +319,8 @@ func (m *ChatMachine) updateOnce(
 		); err != nil {
 			return xerrors.Errorf("buffer chat update: %w", err)
 		}
-		if state.IsRunnable() {
+		// A local acquire just wrote a fresh lease.
+		if state.IsRunnable() && acquired == nil {
 			stale, err := ownershipStaleOrMissing(txCtx, store, chat, HeartbeatStaleSeconds)
 			if err != nil {
 				return xerrors.Errorf("evaluate ownership: %w", err)
@@ -295,7 +339,35 @@ func (m *ChatMachine) updateOnce(
 	if err != nil {
 		return updated, err
 	}
-	return updated, buffer.Flush()
+	flushErr := buffer.Flush()
+	if acquired != nil {
+		// The chat is committed as ours even if a publication failed, so
+		// start it rather than leave the lease to expire.
+		acquirer.StartAcquired(m.chatID, *acquired)
+	}
+	return updated, flushErr
+}
+
+// acquireLocally acquires an unowned runnable chat for acquirer and
+// returns the post-acquire row, or returns chat unchanged when the chat is
+// owned or acquirer declines. Stale-owner takeovers stay on the worker
+// path, which rechecks the lease under the admission lock.
+func acquireLocally(tx *Tx, acquirer LocalAcquirer, chat database.Chat) (database.Chat, *AcquireInput, error) {
+	if chat.WorkerID.Valid || chat.RunnerID.Valid {
+		return chat, nil, nil
+	}
+	input, ok, err := acquirer.PrepareAcquire(tx.ctx, tx.store, chat)
+	if err != nil {
+		return database.Chat{}, nil, xerrors.Errorf("prepare local acquire: %w", err)
+	}
+	if !ok {
+		return chat, nil, nil
+	}
+	result, err := tx.acquireFrom(chat, input)
+	if err != nil {
+		return database.Chat{}, nil, xerrors.Errorf("local acquire: %w", err)
+	}
+	return result.Chat, &input, nil
 }
 
 // Lock locks the chat row with FOR UPDATE and runs fn in a

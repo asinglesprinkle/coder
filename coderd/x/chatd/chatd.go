@@ -1457,6 +1457,7 @@ func (p *Server) CreateChat(ctx context.Context, opts CreateOptions) (database.C
 		InitialStatus:   initialStatus,
 		MaxFileLinks:    p.chatLimits.MaxAttachmentsPerChat,
 		AdmitInTx:       opts.AdmitInTx,
+		LocalAcquirer:   p.localAcquirer(),
 
 		ManageAutomationsEnabled: opts.ManageAutomationsEnabled,
 	})

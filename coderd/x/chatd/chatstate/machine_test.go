@@ -6,9 +6,11 @@ import (
 	"encoding/json"
 	"slices"
 	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/google/uuid"
+	"github.com/lib/pq"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/xerrors"
@@ -591,4 +593,359 @@ func TestCreateChat_AuthorizesFromInsertedChat(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, res.InitialMessages, 1)
 	require.Equal(t, 1, counts.getChatByID)
+}
+
+// fakeLocalAcquirer records LocalAcquirer calls. StartAcquired captures
+// the committed row and the publications made so far, so tests can check
+// it runs after commit and publication.
+type fakeLocalAcquirer struct {
+	db      database.Store
+	pub     *recordingPubsub
+	decline bool
+	// prepare, when set, runs at the start of PrepareAcquire.
+	prepare func(ctx context.Context, store database.Store) error
+
+	mu       sync.Mutex
+	prepares int
+	inputs   []chatstate.AcquireInput
+	starts   []fakeLocalStart
+}
+
+type fakeLocalStart struct {
+	chatID    uuid.UUID
+	input     chatstate.AcquireInput
+	committed database.Chat
+	published []string
+}
+
+func (a *fakeLocalAcquirer) PrepareAcquire(ctx context.Context, store database.Store, _ database.Chat) (chatstate.AcquireInput, bool, error) {
+	a.mu.Lock()
+	a.prepares++
+	a.mu.Unlock()
+	if a.prepare != nil {
+		if err := a.prepare(ctx, store); err != nil {
+			return chatstate.AcquireInput{}, false, err
+		}
+	}
+	if a.decline {
+		return chatstate.AcquireInput{}, false, nil
+	}
+	input := chatstate.AcquireInput{WorkerID: uuid.New(), RunnerID: uuid.New()}
+	a.mu.Lock()
+	a.inputs = append(a.inputs, input)
+	a.mu.Unlock()
+	return input, true, nil
+}
+
+func (a *fakeLocalAcquirer) StartAcquired(chatID uuid.UUID, input chatstate.AcquireInput) {
+	committed, _ := a.db.GetChatByID(context.Background(), chatID)
+	a.pub.mu.Lock()
+	published := slices.Clone(a.pub.channels)
+	a.pub.mu.Unlock()
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.starts = append(a.starts, fakeLocalStart{chatID: chatID, input: input, committed: committed, published: published})
+}
+
+func (a *fakeLocalAcquirer) counts() (prepares, starts int) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.prepares, len(a.starts)
+}
+
+// requireLocallyAcquired checks that a started the chat once, after the
+// commit that made input its owner and after the owned chat:update.
+func requireLocallyAcquired(t *testing.T, f *testFixture, a *fakeLocalAcquirer, chatID uuid.UUID, returned database.Chat) {
+	t.Helper()
+	ctx := testutil.Context(t, testutil.WaitShort)
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	require.Len(t, a.inputs, 1)
+	require.Len(t, a.starts, 1)
+	start := a.starts[0]
+	input := a.inputs[0]
+	require.Equal(t, chatID, start.chatID)
+	require.Equal(t, input, start.input)
+	require.Equal(t, uuid.NullUUID{UUID: input.WorkerID, Valid: true}, start.committed.WorkerID)
+	require.Equal(t, uuid.NullUUID{UUID: input.RunnerID, Valid: true}, start.committed.RunnerID)
+	require.Contains(t, start.published, coderdpubsub.ChatStateUpdateChannel(chatID))
+	require.Equal(t, f.readChat(ctx, t, chatID), returned, "the returned row is the owned row")
+
+	_, err := f.DB.GetChatHeartbeat(ctx, database.GetChatHeartbeatParams{ChatID: chatID, RunnerID: input.RunnerID})
+	require.NoError(t, err)
+
+	f.Pub.mu.Lock()
+	defer f.Pub.mu.Unlock()
+	channel := coderdpubsub.ChatStateUpdateChannel(chatID)
+	for i := len(f.Pub.channels) - 1; i >= 0; i-- {
+		if f.Pub.channels[i] != channel {
+			continue
+		}
+		var msg coderdpubsub.ChatStateUpdateMessage
+		require.NoError(t, json.Unmarshal(f.Pub.payloads[i], &msg))
+		require.NotNil(t, msg.WorkerID)
+		require.NotNil(t, msg.RunnerID)
+		require.Equal(t, input.WorkerID, *msg.WorkerID)
+		require.Equal(t, input.RunnerID, *msg.RunnerID)
+		return
+	}
+	t.Fatalf("no chat:update on %s", channel)
+}
+
+func TestChatMachine_Update_LocalAcquirer(t *testing.T) {
+	t.Parallel()
+
+	sendMessage := func(f *testFixture) func(*chatstate.Tx, database.Store) error {
+		return func(tx *chatstate.Tx, _ database.Store) error {
+			_, err := tx.SendMessage(chatstate.SendMessageInput{
+				Message:      userTextMessage("next", f.User.ID, f.Model.ID),
+				BusyBehavior: chatstate.BusyBehaviorQueue,
+				MaxQueueSize: codersdk.DefaultChatMaxQueuedMessagesPerChat,
+			})
+			return err
+		}
+	}
+	// waitingChat returns an unowned chat in W, so SendMessage makes it
+	// runnable and unowned.
+	waitingChat := func(t *testing.T, f *testFixture) uuid.UUID {
+		created := createTestChat(t, f)
+		landInW(t, f, chatstate.NewChatMachine(f.DB, f.Pub, created.Chat.ID))
+		return created.Chat.ID
+	}
+
+	t.Run("AcquiresRunnableUnownedChat", func(t *testing.T) {
+		t.Parallel()
+		f := newTestFixture(t)
+		ctx := testutil.Context(t, testutil.WaitShort)
+		chatID := waitingChat(t, f)
+		hints := f.Pub.ownershipPublishCount()
+
+		a := &fakeLocalAcquirer{db: f.DB, pub: f.Pub}
+		counts := &chatReadCounts{}
+		m := chatstate.NewChatMachine(&chatReadCountingStore{Store: f.DB, counts: counts}, f.Pub, chatID).WithLocalAcquirer(a)
+		updated, err := m.UpdateReturning(ctx, sendMessage(f))
+		require.NoError(t, err)
+		requireLocallyAcquired(t, f, a, chatID, updated)
+		require.Equal(t, database.ChatStatusRunning, updated.Status)
+		require.Equal(t, hints, f.Pub.ownershipPublishCount(), "a local acquire publishes no ownership hint")
+		require.Equal(t, 1, counts.getChatByID, "the acquire reuses its own write's row")
+	})
+
+	t.Run("DeclinedPublishesHint", func(t *testing.T) {
+		t.Parallel()
+		f := newTestFixture(t)
+		ctx := testutil.Context(t, testutil.WaitShort)
+		chatID := waitingChat(t, f)
+		hints := f.Pub.ownershipPublishCount()
+
+		a := &fakeLocalAcquirer{db: f.DB, pub: f.Pub, decline: true}
+		m := chatstate.NewChatMachine(f.DB, f.Pub, chatID).WithLocalAcquirer(a)
+		updated, err := m.UpdateReturning(ctx, sendMessage(f))
+		require.NoError(t, err)
+		prepares, starts := a.counts()
+		require.Equal(t, 1, prepares)
+		require.Zero(t, starts)
+		require.False(t, updated.WorkerID.Valid)
+		require.Equal(t, hints+1, f.Pub.ownershipPublishCount())
+	})
+
+	t.Run("OwnedChatSkipsPrepare", func(t *testing.T) {
+		t.Parallel()
+		f := newTestFixture(t)
+		ctx := testutil.Context(t, testutil.WaitShort)
+		created := createTestChat(t, f)
+		owner := chatstate.AcquireInput{WorkerID: uuid.New(), RunnerID: uuid.New()}
+		require.NoError(t, chatstate.NewChatMachine(f.DB, f.Pub, created.Chat.ID).Update(ctx, func(tx *chatstate.Tx, _ database.Store) error {
+			_, err := tx.Acquire(owner)
+			return err
+		}))
+
+		a := &fakeLocalAcquirer{db: f.DB, pub: f.Pub}
+		m := chatstate.NewChatMachine(f.DB, f.Pub, created.Chat.ID).WithLocalAcquirer(a)
+		updated, err := m.UpdateReturning(ctx, sendMessage(f))
+		require.NoError(t, err)
+		prepares, starts := a.counts()
+		require.Zero(t, prepares)
+		require.Zero(t, starts)
+		require.Equal(t, owner.RunnerID, updated.RunnerID.UUID)
+	})
+
+	t.Run("NestedUpdateSkipsPrepare", func(t *testing.T) {
+		t.Parallel()
+		f := newTestFixture(t)
+		ctx := testutil.Context(t, testutil.WaitShort)
+		chatID := waitingChat(t, f)
+
+		a := &fakeLocalAcquirer{db: f.DB, pub: f.Pub}
+		outer := chatstate.NewChatMachine(f.DB, f.Pub, chatID)
+		require.NoError(t, outer.Update(ctx, func(tx *chatstate.Tx, store database.Store) error {
+			inner := chatstate.NewChatMachine(store, f.Pub, chatID).WithLocalAcquirer(a)
+			return inner.Update(tx.Ctx(), sendMessage(f))
+		}))
+		prepares, starts := a.counts()
+		require.Zero(t, prepares)
+		require.Zero(t, starts)
+		require.False(t, f.readChat(ctx, t, chatID).WorkerID.Valid)
+	})
+
+	t.Run("CallbackErrorStartsNothing", func(t *testing.T) {
+		t.Parallel()
+		f := newTestFixture(t)
+		ctx := testutil.Context(t, testutil.WaitShort)
+		chatID := waitingChat(t, f)
+
+		a := &fakeLocalAcquirer{db: f.DB, pub: f.Pub}
+		m := chatstate.NewChatMachine(f.DB, f.Pub, chatID).WithLocalAcquirer(a)
+		wantErr := xerrors.New("callback failed")
+		err := m.Update(ctx, func(tx *chatstate.Tx, store database.Store) error {
+			if err := sendMessage(f)(tx, store); err != nil {
+				return err
+			}
+			return wantErr
+		})
+		require.ErrorIs(t, err, wantErr)
+		prepares, starts := a.counts()
+		require.Zero(t, prepares)
+		require.Zero(t, starts)
+	})
+
+	t.Run("PrepareErrorRollsBack", func(t *testing.T) {
+		t.Parallel()
+		f := newTestFixture(t)
+		ctx := testutil.Context(t, testutil.WaitShort)
+		chatID := waitingChat(t, f)
+		before := f.readChat(ctx, t, chatID)
+
+		wantErr := xerrors.New("prepare failed")
+		a := &fakeLocalAcquirer{db: f.DB, pub: f.Pub, prepare: func(context.Context, database.Store) error {
+			return wantErr
+		}}
+		m := chatstate.NewChatMachine(f.DB, f.Pub, chatID).WithLocalAcquirer(a)
+		err := m.Update(ctx, sendMessage(f))
+		require.ErrorIs(t, err, wantErr)
+		_, starts := a.counts()
+		require.Zero(t, starts)
+		require.Equal(t, before.SnapshotVersion, f.readChat(ctx, t, chatID).SnapshotVersion)
+	})
+
+	t.Run("DeadlockRetryStartsOnce", func(t *testing.T) {
+		t.Parallel()
+		f := newTestFixture(t)
+		ctx := testutil.Context(t, testutil.WaitShort)
+		chatID := waitingChat(t, f)
+
+		// The first attempt prepares, then its acquire hits a deadlock
+		// abort, so Update reruns the whole attempt with a new input.
+		a := &fakeLocalAcquirer{db: f.DB, pub: f.Pub, prepare: func(ctx context.Context, store database.Store) error {
+			_, err := chatstate.LockAutomations(ctx, store, []uuid.UUID{uuid.New()})
+			return err
+		}}
+		failures := &atomic.Int32{}
+		failures.Store(1)
+		store := &heartbeatDeadlockStore{Store: f.DB, failures: failures}
+		m := chatstate.NewChatMachine(store, f.Pub, chatID).WithLocalAcquirer(a)
+		updated, err := m.UpdateReturning(ctx, sendMessage(f))
+		require.NoError(t, err)
+		prepares, _ := a.counts()
+		require.Equal(t, 2, prepares)
+		a.mu.Lock()
+		require.Len(t, a.inputs, 2)
+		a.inputs = a.inputs[1:]
+		a.mu.Unlock()
+		requireLocallyAcquired(t, f, a, chatID, updated)
+	})
+}
+
+// heartbeatDeadlockStore injects a PostgreSQL deadlock abort into the
+// first failures heartbeat upserts.
+type heartbeatDeadlockStore struct {
+	database.Store
+	failures *atomic.Int32
+}
+
+func (s *heartbeatDeadlockStore) InTx(fn func(database.Store) error, opts *database.TxOptions) error {
+	return s.Store.InTx(func(tx database.Store) error {
+		return fn(&heartbeatDeadlockStore{Store: tx, failures: s.failures})
+	}, opts)
+}
+
+func (s *heartbeatDeadlockStore) UpsertChatHeartbeat(ctx context.Context, arg database.UpsertChatHeartbeatParams) error {
+	if s.failures.Add(-1) >= 0 {
+		return &pq.Error{Code: "40P01", Message: "deadlock detected"}
+	}
+	return s.Store.UpsertChatHeartbeat(ctx, arg)
+}
+
+func TestCreateChatWithID_LocalAcquirer(t *testing.T) {
+	t.Parallel()
+
+	create := func(t *testing.T, f *testFixture, a chatstate.LocalAcquirer, status database.ChatStatus) (uuid.UUID, chatstate.CreateChatResult, error) {
+		t.Helper()
+		chatID := uuid.New()
+		res, err := chatstate.CreateChatWithID(testutil.Context(t, testutil.WaitShort), f.DB, f.Pub, chatID, chatstate.CreateChatInput{
+			OrganizationID:    f.Org.ID,
+			OwnerID:           f.User.ID,
+			LastModelConfigID: f.Model.ID,
+			Title:             "test",
+			ClientType:        database.ChatClientTypeApi,
+			InitialStatus:     status,
+			InitialMessages: []chatstate.Message{
+				userTextMessage("hello", f.User.ID, f.Model.ID),
+			},
+			LocalAcquirer: a,
+		})
+		return chatID, res, err
+	}
+
+	t.Run("AcquiresRunnableChat", func(t *testing.T) {
+		t.Parallel()
+		f := newTestFixture(t)
+		a := &fakeLocalAcquirer{db: f.DB, pub: f.Pub}
+		chatID, res, err := create(t, f, a, database.ChatStatusRunning)
+		require.NoError(t, err)
+		requireLocallyAcquired(t, f, a, chatID, res.Chat)
+		require.Equal(t, int64(1), res.Chat.SnapshotVersion)
+		require.False(t, f.Pub.hasOwnership())
+	})
+
+	t.Run("DeclinedPublishesHint", func(t *testing.T) {
+		t.Parallel()
+		f := newTestFixture(t)
+		a := &fakeLocalAcquirer{db: f.DB, pub: f.Pub, decline: true}
+		_, res, err := create(t, f, a, database.ChatStatusRunning)
+		require.NoError(t, err)
+		prepares, starts := a.counts()
+		require.Equal(t, 1, prepares)
+		require.Zero(t, starts)
+		require.False(t, res.Chat.WorkerID.Valid)
+		require.True(t, f.Pub.hasOwnership())
+	})
+
+	t.Run("WaitingChatSkipsPrepare", func(t *testing.T) {
+		t.Parallel()
+		f := newTestFixture(t)
+		a := &fakeLocalAcquirer{db: f.DB, pub: f.Pub}
+		_, res, err := create(t, f, a, database.ChatStatusWaiting)
+		require.NoError(t, err)
+		prepares, starts := a.counts()
+		require.Zero(t, prepares)
+		require.Zero(t, starts)
+		require.False(t, res.Chat.WorkerID.Valid)
+	})
+
+	t.Run("PrepareErrorCreatesNothing", func(t *testing.T) {
+		t.Parallel()
+		f := newTestFixture(t)
+		wantErr := xerrors.New("prepare failed")
+		a := &fakeLocalAcquirer{db: f.DB, pub: f.Pub, prepare: func(context.Context, database.Store) error {
+			return wantErr
+		}}
+		chatID, _, err := create(t, f, a, database.ChatStatusRunning)
+		require.ErrorIs(t, err, wantErr)
+		_, starts := a.counts()
+		require.Zero(t, starts)
+		_, err = f.DB.GetChatByID(testutil.Context(t, testutil.WaitShort), chatID)
+		require.ErrorIs(t, err, sql.ErrNoRows)
+		require.Empty(t, f.Pub.channels)
+	})
 }

@@ -61,6 +61,11 @@ type CreateChatInput struct {
 	// stamped on the single user-role initial message. An error rolls
 	// back the whole creation.
 	AdmitInTx AdmitFunc
+	// LocalAcquirer, when set, may acquire a runnable new chat in the
+	// creation transaction instead of publishing an ownership hint. See
+	// [ChatMachine.WithLocalAcquirer]; store must not be an outer
+	// transaction.
+	LocalAcquirer LocalAcquirer
 }
 
 // CreateChatResult is the value returned by [CreateChat]. It carries
@@ -152,10 +157,18 @@ func insertChat(
 			)
 		}
 	}
-	var result CreateChatResult
+	var (
+		result   CreateChatResult
+		acquired *AcquireInput
+	)
+	acquirer := input.LocalAcquirer
+	if _, nested := updateAttemptFromContext(ctx); nested {
+		acquirer = nil
+	}
 	buffer := NewPublishBuffer(publisher)
 	defer buffer.Discard()
 	err := store.InTx(func(store database.Store) error {
+		acquired = nil
 		if input.RootChatID.Valid {
 			// Lock the family root before inserting the child so this
 			// transaction serializes with SetFamilyArchived, which also
@@ -235,6 +248,16 @@ func insertChat(
 		if err != nil {
 			return xerrors.Errorf("reload chat after initial messages: %w", err)
 		}
+		runnable := ClassifyExecutionState(refreshed, false, true).IsRunnable()
+		if acquirer != nil && runnable {
+			// Creation is the transition, so the acquire needs no lock or
+			// snapshot bump of its own.
+			tx := &Tx{ctx: chatCtx, store: store, chatID: refreshed.ID}
+			refreshed, acquired, err = acquireLocally(tx, acquirer, refreshed)
+			if err != nil {
+				return err
+			}
+		}
 		result = CreateChatResult{
 			Chat:            refreshed,
 			InitialMessages: fromInsertedRows(inserted),
@@ -245,7 +268,7 @@ func insertChat(
 		); err != nil {
 			return xerrors.Errorf("buffer chat update: %w", err)
 		}
-		if ClassifyExecutionState(refreshed, false, true).IsRunnable() {
+		if runnable && acquired == nil {
 			if err := buffer.Publish(
 				coderdpubsub.ChatStateOwnershipChannel,
 				buildChatOwnershipMessage(refreshed),
@@ -258,8 +281,12 @@ func insertChat(
 	if err != nil {
 		return CreateChatResult{}, err
 	}
-	if err := buffer.Flush(); err != nil {
-		return result, err
+	flushErr := buffer.Flush()
+	if acquired != nil {
+		acquirer.StartAcquired(result.Chat.ID, *acquired)
+	}
+	if flushErr != nil {
+		return result, flushErr
 	}
 	return result, nil
 }
@@ -1377,7 +1404,10 @@ type AcquireInput struct {
 }
 
 // AcquireResult is returned by [Tx.Acquire].
-type AcquireResult struct{}
+type AcquireResult struct {
+	// Chat is the chat row after the ownership write.
+	Chat database.Chat
+}
 
 // Acquire claims the chat for a worker/runner pair. Execution state
 // is preserved.
@@ -1393,7 +1423,13 @@ func (tx *Tx) Acquire(input AcquireInput) (AcquireResult, error) {
 	if err != nil {
 		return AcquireResult{}, err
 	}
-	if _, err := tx.applyExecutionState(executionStateUpdate{
+	return tx.acquireFrom(chat, input)
+}
+
+// acquireFrom applies [Tx.Acquire] to chat, the current row of the locked
+// chat.
+func (tx *Tx) acquireFrom(chat database.Chat, input AcquireInput) (AcquireResult, error) {
+	updated, err := tx.applyExecutionState(executionStateUpdate{
 		Status:                   chat.Status,
 		Archived:                 chat.Archived,
 		WorkerID:                 uuid.NullUUID{UUID: input.WorkerID, Valid: true},
@@ -1401,7 +1437,8 @@ func (tx *Tx) Acquire(input AcquireInput) (AcquireResult, error) {
 		LastError:                chat.LastError,
 		RequiresActionDeadlineAt: chat.RequiresActionDeadlineAt,
 		CompactionRequestedAt:    chat.CompactionRequestedAt,
-	}); err != nil {
+	})
+	if err != nil {
 		return AcquireResult{}, xerrors.Errorf("set ownership: %w", err)
 	}
 	if err := tx.store.UpsertChatHeartbeat(tx.ctx, database.UpsertChatHeartbeatParams{
@@ -1413,7 +1450,7 @@ func (tx *Tx) Acquire(input AcquireInput) (AcquireResult, error) {
 	// Acquire writes a fresh heartbeat itself, so the post-commit
 	// ownership-hint logic in Update will evaluate the heartbeat as
 	// fresh and skip publishing a `chat:ownership` hint.
-	return AcquireResult{}, nil
+	return AcquireResult{Chat: updated}, nil
 }
 
 // AbandonInput is intentionally empty. Ownership-fence checks belong

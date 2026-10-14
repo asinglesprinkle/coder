@@ -56,6 +56,7 @@ import (
 	dbpubsub "github.com/coder/coder/v2/coderd/database/pubsub"
 	experimentrules "github.com/coder/coder/v2/coderd/experiments"
 	"github.com/coder/coder/v2/coderd/experiments/experimentstest"
+	coderdpubsub "github.com/coder/coder/v2/coderd/pubsub"
 	"github.com/coder/coder/v2/coderd/rbac"
 	"github.com/coder/coder/v2/coderd/util/slice"
 	"github.com/coder/coder/v2/coderd/workspacestats"
@@ -13962,6 +13963,110 @@ func TestSendMessageImmediatelyProcessesWaitingChat(t *testing.T) {
 	// Both turns processed. Verify the second request reached the LLM.
 	require.GreaterOrEqual(t, requestCount.Load(), int32(2),
 		"LLM should have received at least 2 streaming requests")
+}
+
+type unlockedAgentCapacity struct{}
+
+func (unlockedAgentCapacity) Unlocked() bool { return true }
+
+// TestLocalFirstAcquisition covers that a started, uncapped server
+// acquires the chats its CreateChat and SendMessage make runnable without
+// an ownership hint, and that other servers fall back to the hint.
+func TestLocalFirstAcquisition(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name      string
+		uncapped  bool
+		start     bool
+		wantLocal bool
+	}{
+		{name: "Uncapped", uncapped: true, start: true, wantLocal: true},
+		{name: "Capped", start: true},
+		{name: "WorkerNotStarted", uncapped: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			db, ps := dbtestutil.NewDB(t)
+			ctx := testutil.Context(t, testutil.WaitSuperLong)
+
+			var hints atomic.Int32
+			cancel, err := ps.SubscribeWithErr(coderdpubsub.ChatStateOwnershipChannel, coderdpubsub.HandleChatStateOwnership(
+				func(context.Context, coderdpubsub.ChatStateOwnershipMessage, error) { hints.Add(1) },
+			))
+			require.NoError(t, err)
+			t.Cleanup(cancel)
+
+			var requests atomic.Int32
+			openAIURL := chattest.NewOpenAI(t, func(req *chattest.OpenAIRequest) chattest.OpenAIResponse {
+				if !req.Stream {
+					return chattest.OpenAINonStreamingResponse("title")
+				}
+				requests.Add(1)
+				return chattest.OpenAIStreamingResponse(chattest.OpenAITextChunks("response")...)
+			})
+			replicaID := uuid.New()
+			configure := func(cfg *chatd.Config) {
+				cfg.ReplicaID = replicaID
+				cfg.PendingChatAcquireInterval = time.Hour
+				cfg.InFlightChatStaleAfter = testutil.WaitSuperLong
+				cfg.AIBridgeTransportFactory = chatAIGatewayTransportFactoryPointer(chattest.NewMockAIBridgeTransport(t, openAIURL))
+				if tc.uncapped {
+					cfg.AgentCapacityUnlock = unlockedAgentCapacity{}
+				}
+			}
+			var server *chatd.Server
+			if tc.start {
+				server = newActiveTestServer(t, db, ps, configure)
+			} else {
+				server = newTestServer(t, db, ps, replicaID, configure)
+			}
+			user, org, model := seedChatDependencies(t, db)
+			setOpenAIProviderBaseURL(ctx, t, db, openAIURL)
+
+			requireAcquisition := func(chat database.Chat, wantHints int32) {
+				t.Helper()
+				if tc.wantLocal {
+					require.Equal(t, uuid.NullUUID{UUID: replicaID, Valid: true}, chat.WorkerID)
+					require.True(t, chat.RunnerID.Valid)
+					return
+				}
+				require.False(t, chat.WorkerID.Valid)
+				testutil.Eventually(ctx, t, func(context.Context) bool {
+					return hints.Load() >= wantHints
+				}, testutil.IntervalFast)
+			}
+
+			chat, err := server.CreateChat(ctx, chatd.CreateOptions{
+				OrganizationID:     org.ID,
+				OwnerID:            user.ID,
+				Title:              "local-first",
+				ModelConfigID:      model.ID,
+				InitialUserContent: []codersdk.ChatMessagePart{codersdk.ChatMessageText("first")},
+			})
+			require.NoError(t, err)
+			requireAcquisition(chat, 1)
+			if !tc.start {
+				return
+			}
+			waitForChatStatus(ctx, t, db, chat.ID, database.ChatStatusWaiting)
+			chatd.WaitUntilIdleForTest(server)
+
+			sent, err := server.SendMessage(ctx, chatd.SendMessageOptions{
+				ChatID:  chat.ID,
+				Content: []codersdk.ChatMessagePart{codersdk.ChatMessageText("second")},
+			})
+			require.NoError(t, err)
+			requireAcquisition(sent.Chat, 2)
+			waitForChatStatus(ctx, t, db, chat.ID, database.ChatStatusWaiting)
+			chatd.WaitUntilIdleForTest(server)
+
+			require.GreaterOrEqual(t, requests.Load(), int32(2))
+			if tc.wantLocal {
+				require.Zero(t, hints.Load())
+			}
+		})
+	}
 }
 
 // TestAgentContextFilesAndSkillsLoadedIntoChat verifies the full

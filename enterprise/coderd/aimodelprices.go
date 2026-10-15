@@ -273,7 +273,8 @@ func keysAt(keys []aiModelPriceKeys, i int) aiModelPriceKeys {
 // validateAIModelPriceValues reports problems with the four prices of one
 // model price: every price key present, no negative price, and at least one
 // price set. field is where the model price sits in the request, such as
-// "prices[0]", and prefixes each reported field.
+// "prices[0]", and prefixes each reported field. It is empty when the request
+// body is the model price itself.
 func validateAIModelPriceValues(field string, keys aiModelPriceKeys, input, output, cacheRead, cacheWrite *int64) []codersdk.ValidationError {
 	named := []struct {
 		name  string
@@ -297,7 +298,7 @@ func validateAIModelPriceValues(field string, keys aiModelPriceKeys, input, outp
 		populated++
 		if *p.value < 0 {
 			validations = append(validations, codersdk.ValidationError{
-				Field:  field + "." + p.name,
+				Field:  joinField(field, p.name),
 				Detail: "Price must not be negative.",
 			})
 		}
@@ -311,7 +312,7 @@ func validateAIModelPriceValues(field string, keys aiModelPriceKeys, input, outp
 				continue
 			}
 			validations = append(validations, codersdk.ValidationError{
-				Field:  field + "." + p.name,
+				Field:  joinField(field, p.name),
 				Detail: "Price is required. Use 'null' for a price that is not known.",
 			})
 		}
@@ -328,4 +329,13 @@ func validateAIModelPriceValues(field string, keys aiModelPriceKeys, input, outp
 	}
 
 	return validations
+}
+
+// joinField returns the path of name inside field, or name alone when field is
+// the request body itself.
+func joinField(field, name string) string {
+	if field == "" {
+		return name
+	}
+	return field + "." + name
 }
